@@ -63,50 +63,40 @@ impl NFTStakingContract {
     }
 
     #[payable]
-    pub fn stake_nfts(&mut self, nft_ids: Vec<String>) {
-        let staker_id = env::predecessor_account_id();
-        let start_timestamp = env::block_timestamp();
+    pub fn nft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        token_id: String
+    ) -> bool {
+        env::log_str(&format!("Received NFT {} from {}", token_id, sender_id));
     
-        // Ensure the user has provided at least one NFT ID
-        assert!(!nft_ids.is_empty(), "NFT IDs cannot be empty");
+        // Default lockup period of 30 days
+        let lockup_days: u64 = 30;
     
-        // Batch approve all NFTs
-        Promise::new(self.sin_nft_contract.clone()).function_call(
-            "nft_batch_transfer".to_string(),
-            serde_json::to_vec(&json!({
-                "token_ids": nft_ids
-                    .iter()
-                    .map(|nft_id| (nft_id.clone(), env::current_account_id()))
-                    .collect::<Vec<_>>(),
-            }))
-            .expect("Failed to serialize nft_batch_transfer arguments"),
-            NearToken::from_yoctonear(1), // Attach 1 yoctoNEAR
-            Gas::from_tgas(100), // Adjust gas as needed for batch transfer
-        );
+        // Default NFT classification
+        let nft_type = "Drone".to_string();
     
-        // Default to "Drone" type for now; will be updated during metadata fetching
-        let nft_types: HashMap<String, String> = nft_ids
-            .iter()
-            .map(|nft_id| (nft_id.clone(), "Drone".to_string()))
-            .collect();
-    
-        // Update staker info
-        let mut staker_info = self.stakers.get(&staker_id).unwrap_or_else(|| StakerInfo {
-            stakes: Vector::new(format!("stakes_{}", staker_id).as_bytes().to_vec()),
+        // Fetch or create staker info
+        let mut staker_info = self.stakers.get(&sender_id).unwrap_or_else(|| StakerInfo {
+            stakes: Vector::new(format!("stakes_{}", sender_id).as_bytes().to_vec()),
             total_rewards_claimed: 0,
         });
     
+        // Add the staking record
         staker_info.stakes.push(&NFTStakingRecord {
-            nft_ids,
-            nft_types,
-            start_timestamp,
-            lockup_period: MONTH,
+            nft_ids: vec![token_id.clone()],
+            nft_types: vec![(token_id.clone(), nft_type)].into_iter().collect(),
+            start_timestamp: env::block_timestamp(),
+            lockup_period: lockup_days * DAY,
             claimed_rewards: 0,
         });
     
-        self.stakers.insert(&staker_id, &staker_info);
+        self.stakers.insert(&sender_id, &staker_info);
     
-        env::log_str(&format!("NFTs staked by {} successfully", staker_id));
+        env::log_str(&format!("NFT {} staked by {} successfully", token_id, sender_id));
+    
+        // Returning `false` ensures the NFT is not refunded
+        false
     }
 
 
