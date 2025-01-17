@@ -1,0 +1,259 @@
+use near_sdk::{
+    borsh::{self, BorshDeserialize, BorshSerialize},
+    collections::{UnorderedMap, Vector},
+    env, near_bindgen, AccountId, PanicOnDefault, Promise, NearToken,
+};
+use near_sdk:: Gas;
+use serde_json::Value;
+use std::collections::HashMap;
+use serde_json::json;
+use near_sdk::serde::{Deserialize, Serialize};
+
+const DAY: u64 = 86400; // Seconds in a day
+const MONTH: u64 = 30 * DAY; // Seconds in a month
+
+#[derive(BorshDeserialize, BorshSerialize, Clone, Serialize, Deserialize)]
+pub struct NFTStakingRecord {
+    pub nft_ids: Vec<String>, // List of NFT IDs in the staking
+    pub nft_types: HashMap<String, String>, // Map of NFT ID -> Type (Queen, Worker, Drone)
+    pub start_timestamp: u64,
+    pub lockup_period: u64,
+    pub claimed_rewards: u128,
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct StakerInfo {
+    pub stakes: Vector<NFTStakingRecord>,
+    pub total_rewards_claimed: u128,
+}
+
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct NFTStakingContract {
+    pub owner: AccountId,
+    sin_token: AccountId,
+    sin_nft_contract: AccountId,
+    pub stakers: UnorderedMap<AccountId, StakerInfo>,
+    pub reward_pool: u128,
+    pub last_distributed: u64,
+    pub nft_weights: HashMap<String, u32>, // Map for NFT type -> Weight
+    pub staked_nfts: HashMap<String, AccountId>, // Tracks currently staked NFTs and their owners
+}
+
+#[near_bindgen]
+impl NFTStakingContract {
+    #[init]
+    pub fn new(owner: AccountId, sin_token: AccountId, sin_nft_contract: AccountId) -> Self {
+        let mut nft_weights = HashMap::new();
+        nft_weights.insert("Queen".to_string(), 50);
+        nft_weights.insert("Worker".to_string(), 30);
+        nft_weights.insert("Drone".to_string(), 20);
+
+        Self {
+            owner,
+            sin_token,
+            sin_nft_contract,
+            stakers: UnorderedMap::new(b"s".to_vec()),
+            reward_pool: 0,
+            last_distributed: env::block_timestamp(),
+            nft_weights,
+            staked_nfts: HashMap::new(),
+        }
+    }
+
+    #[payable]
+    pub fn process_nft_batch_transfer_log(&mut self, log_data: serde_json::Value) -> bool {
+        let log_entries = log_data["data"].as_array().expect("Invalid log data format");
+
+        for entry in log_entries {
+            let old_owner_id = entry["old_owner_id"]
+                .as_str()
+                .expect("Missing old_owner_id");
+            let new_owner_id = entry["new_owner_id"]
+                .as_str()
+                .expect("Missing new_owner_id");
+            let token_ids = entry["token_ids"]
+                .as_array()
+                .expect("Missing token_ids");
+
+            assert_eq!(
+                new_owner_id,
+                env::current_account_id().as_str(),
+                "NFTs must be transferred to this contract"
+            );
+
+            let old_owner_account = old_owner_id
+                .parse::<AccountId>()
+                .expect("Invalid old_owner_id format");
+
+            for token_id in token_ids {
+                let token_id_str = token_id.as_str().expect("Invalid token_id");
+
+                // Ensure the NFT is not already staked
+                if let Some(current_owner) = self.staked_nfts.get(token_id_str) {
+                    panic!(
+                        "NFT {} is already staked by {}",
+                        token_id_str, current_owner
+                    );
+                }
+
+                env::log_str(&format!(
+                    "Processing NFT {} transferred from {} to {}",
+                    token_id_str, old_owner_account, new_owner_id
+                ));
+
+                let nft_metadata = self.fetch_nft_metadata(token_id_str.to_string());
+                let nft_type = Self::classify_nft_type(&nft_metadata);
+
+                self.add_staking_record(
+                    old_owner_account.clone(),
+                    token_id_str.to_string(),
+                    nft_type,
+                );
+            }
+        }
+
+        env::log_str("Batch NFT staking records updated successfully");
+        true
+    }
+
+    fn fetch_nft_metadata(&self, token_id: String) -> Value {
+        serde_json::json!({
+            "reference_blob": {
+                "attributes": [
+                    { "trait_type": "Body", "value": "Queen" },
+                    { "trait_type": "Wings", "value": "Diamond" }
+                ]
+            }
+        })
+    }
+
+    fn classify_nft_type(meta: &Value) -> String {
+        let attributes = match meta.get("reference_blob")
+            .and_then(|blob| blob.get("attributes"))
+            .and_then(|attrs| attrs.as_array()) {
+                Some(attrs) => attrs,
+                None => return "Drone".to_string(),
+        };
+
+        for attribute in attributes {
+            if let (Some(trait_type), Some(value)) = (
+                attribute.get("trait_type").and_then(|t| t.as_str()),
+                attribute.get("value").and_then(|v| v.as_str()),
+            ) {
+                if trait_type == "Body" && value == "Queen" {
+                    return "Queen".to_string();
+                } else if trait_type == "Wings" && value == "Diamond" {
+                    return "Worker".to_string();
+                }
+            }
+        }
+        "Drone".to_string()
+    }
+
+    fn add_staking_record(&mut self, sender_id: AccountId, token_id: String, nft_type: String) {
+        let lockup_days: u64 = 30;
+
+        self.staked_nfts.insert(token_id.clone(), sender_id.clone());
+
+        let mut staker_info = self.stakers.get(&sender_id).unwrap_or_else(|| StakerInfo {
+            stakes: Vector::new(format!("stakes_{}", sender_id).as_bytes().to_vec()),
+            total_rewards_claimed: 0,
+        });
+
+        staker_info.stakes.push(&NFTStakingRecord {
+            nft_ids: vec![token_id.clone()],
+            nft_types: vec![(token_id.clone(), nft_type)].into_iter().collect(),
+            start_timestamp: env::block_timestamp(),
+            lockup_period: lockup_days * DAY,
+            claimed_rewards: 0,
+        });
+
+        self.stakers.insert(&sender_id, &staker_info);
+    }
+
+    pub fn unstake_nfts(&mut self, stake_index: u64) {
+        let staker_id = env::predecessor_account_id();
+        let mut staker_info = self.stakers.get(&staker_id).expect("Staker not found");
+
+        assert!(
+            stake_index < staker_info.stakes.len(),
+            "Invalid staking record index"
+        );
+
+        let stake = staker_info.stakes.get(stake_index).unwrap();
+        let current_time = env::block_timestamp();
+        assert!(
+            current_time >= stake.start_timestamp + stake.lockup_period,
+            "Cannot unstake before lockup period"
+        );
+
+        let nft_ids = stake.nft_ids.clone();
+        for nft_id in &nft_ids {
+            self.staked_nfts.remove(nft_id);
+        }
+        staker_info.stakes.swap_remove(stake_index);
+        self.stakers.insert(&staker_id, &staker_info);
+
+        let transfer_data: Vec<(String, AccountId)> = nft_ids
+            .iter()
+            .map(|nft_id| (nft_id.clone(), staker_id.clone()))
+            .collect();
+
+        Promise::new(self.sin_nft_contract.clone()).function_call(
+            "nft_batch_transfer".to_string(),
+            serde_json::to_vec(&json!({ "token_ids": transfer_data })).unwrap(),
+            NearToken::from_yoctonear(1),
+            Gas::from_tgas(100),
+        );
+    }
+
+    pub fn get_staking_info(&self, staker_id: AccountId) -> Vec<serde_json::Value> {
+        let staker_info = self.stakers.get(&staker_id).expect("Staker not found");
+
+        staker_info
+            .stakes
+            .iter()
+            .map(|stake| {
+                // Aggregate NFT type counts
+                let mut queen_count = 0;
+                let mut worker_count = 0;
+                let mut drone_count = 0;
+
+                for (_, nft_type) in stake.nft_types.iter() {
+                    match nft_type.as_str() {
+                        "Queen" => queen_count += 1,
+                        "Worker" => worker_count += 1,
+                        "Drone" => drone_count += 1,
+                        _ => (),
+                    }
+                }
+
+                // Return the summarized data
+                json!({
+                    "nft_ids": stake.nft_ids,
+                    "queen": queen_count,
+                    "worker": worker_count,
+                    "drone": drone_count,
+                    "start_timestamp": stake.start_timestamp,
+                    "lockup_period": stake.lockup_period,
+                    "claimed_rewards": stake.claimed_rewards
+                })
+            })
+            .collect()
+    }
+
+    pub fn get_last_reward_distribution(&self) -> u64 {
+        self.last_distributed
+    }
+
+    pub fn get_next_reward_distribution(&self) -> u64 {
+        let now = env::block_timestamp();
+        let next_distribution = self.last_distributed + MONTH;
+        if next_distribution > now {
+            (next_distribution - now) / DAY
+        } else {
+            0
+        }
+    }
+}

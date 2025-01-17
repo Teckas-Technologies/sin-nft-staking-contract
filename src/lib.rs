@@ -8,12 +8,11 @@ use serde_json::Value;
 use std::collections::HashMap;
 use serde_json::json;
 use near_sdk::serde::{Deserialize, Serialize};
-use near_sdk::PromiseResult;
+use near_contract_standards::fungible_token::Balance;
 
 
 const DAY: u64 = 86400; // Seconds in a day
 const MONTH: u64 = 30 * DAY; // Seconds in a month
-const MONTHLY_REWARD: u128 = 1_666_666_666_67; // Monthly reward pool
 
 #[derive(BorshDeserialize, BorshSerialize, Clone, Serialize, Deserialize)]
 pub struct NFTStakingRecord {
@@ -30,6 +29,20 @@ pub struct StakerInfo {
     pub total_rewards_claimed: u128,
 }
 
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct FundingRecord {
+    pub amount: Balance,
+    pub timestamp: u64,
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct RewardDistribution {
+    pub total_reward_pool: Balance,
+    pub last_distributed: u64, // Timestamp of last reward distribution
+    pub funding_records: Vector<FundingRecord>, // Track funding history
+}
+
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
 pub struct NFTStakingContract {
@@ -39,6 +52,7 @@ pub struct NFTStakingContract {
     pub stakers: UnorderedMap<AccountId, StakerInfo>,
     pub reward_pool: u128,
     pub last_distributed: u64,
+    pub reward_distribution: RewardDistribution,
     pub nft_weights: HashMap<String, u32>, // Map for NFT type -> Weight
 }
 
@@ -58,45 +72,87 @@ impl NFTStakingContract {
             stakers: UnorderedMap::new(b"s".to_vec()),
             reward_pool: 0,
             last_distributed: env::block_timestamp(),
+            reward_distribution: RewardDistribution {
+                total_reward_pool: 0,
+                last_distributed: env::block_timestamp(),
+                funding_records: Vector::new(b"fundings".to_vec()),
+            },
             nft_weights,
         }
     }
 
     #[payable]
-    pub fn nft_on_transfer(
+    pub fn ft_on_transfer(
         &mut self,
         sender_id: AccountId,
-        token_id: String
-    ) -> bool {
-        env::log_str(&format!("Received NFT {} from {}", token_id, sender_id));
-    
-        // Default lockup period of 30 days
-        let lockup_days: u64 = 30;
-    
-        // Default NFT classification
-        let nft_type = "Drone".to_string();
-    
-        // Fetch or create staker info
-        let mut staker_info = self.stakers.get(&sender_id).unwrap_or_else(|| StakerInfo {
-            stakes: Vector::new(format!("stakes_{}", sender_id).as_bytes().to_vec()),
-            total_rewards_claimed: 0,
+        amount: U128,
+        msg: String,
+    ) -> U128 {
+        env::log_str(&format!("Received {} tokens from {}", amount.0, sender_id));
+        assert_eq!(
+            sender_id,
+            self.owner,
+            "Only Only contract owners are allowed to fund this reward pool"
+        );
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.sin_token,
+            "Only SIN tokens are accepted for funding"
+        );
+        assert!(amount.0 > 0, "Funding amount must be greater than zero");
+
+        // Update total reward pool
+        self.reward_distribution.total_reward_pool += amount.0;
+
+        // Track funding record
+        self.reward_distribution.funding_records.push(&FundingRecord {
+            amount: amount.0,
+            timestamp: env::block_timestamp(),
         });
-    
-        // Add the staking record
-        staker_info.stakes.push(&NFTStakingRecord {
-            nft_ids: vec![token_id.clone()],
-            nft_types: vec![(token_id.clone(), nft_type)].into_iter().collect(),
-            start_timestamp: env::block_timestamp(),
-            lockup_period: lockup_days * DAY,
-            claimed_rewards: 0,
-        });
-    
-        self.stakers.insert(&sender_id, &staker_info);
-    
-        env::log_str(&format!("NFT {} staked by {} successfully", token_id, sender_id));
-    
+
+        env::log_str(&format!(
+            "Reward pool funded with {} SIN tokens by {} with message {}",
+            amount.0, env::predecessor_account_id(), msg
+        ));
+        // Return 0 to indicate all tokens were accepted
+        U128(0)
+    }
+
+    #[payable]
+    pub fn nft_on_transfer(&mut self, sender_id: AccountId, token_id: String, msg: String) -> bool {
+        env::log_str(&format!("Received NFT {} from {} with message {}", token_id, sender_id, msg));
+        
+        // Ensure the call is from the authorized NFT contract
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.sin_nft_contract,
+            "NFT can only be transferred from the SIN NFT contract"
+        );
+
+        // Initiate metadata fetch
+        self.get_nft_metadata(self.sin_nft_contract.clone(), token_id.clone())
+            .then(
+                Self::ext(env::current_account_id()).on_fetch_metadata(
+                    sender_id.clone(),
+                    token_id.clone(),
+                    env::block_timestamp(),
+                ),
+            );
+
         // Returning `false` ensures the NFT is not refunded
         false
+    }
+
+
+    pub fn get_nft_metadata(&self, nft_contract_id: AccountId, token_id: String) -> Promise {
+        Promise::new(nft_contract_id).function_call(
+            "nft_token".to_string(), // Call the `nft_token` method
+            serde_json::json!({ "token_id": token_id })
+                .to_string()
+                .into_bytes(),
+            NearToken::from_yoctonear(0), // Attach no deposit for view call
+            Gas::from_tgas(20),          // Sufficient gas for cross-contract call
+        )
     }
 
 
@@ -104,99 +160,96 @@ impl NFTStakingContract {
     pub fn on_fetch_metadata(
         &mut self,
         staker_id: AccountId,
-        nft_id: String,
+        token_id: String,
         start_timestamp: u64,
+        #[callback_result] call_result: Result<String, near_sdk::PromiseError>,
     ) {
-        // Verify promise result
-        assert_eq!(
-            env::promise_results_count(),
-            1,
-            "Expected exactly one promise result"
-        );
+        // Handle metadata fetch result
+        if let Ok(metadata_str) = call_result {
+            let metadata: Value =
+                serde_json::from_str(&metadata_str).expect("Failed to parse NFT metadata");
 
-        let nft_metadata: Value = match env::promise_result(0) {
-            PromiseResult::Successful(result) => {
-                let metadata = serde_json::from_slice::<Value>(&result)
-                    .expect("Failed to parse NFT metadata");
-        
-                // Print the metadata to the logs
-                env::log_str(&format!(
-                    "Fetched NFT Metadata: {}",
-                    serde_json::to_string_pretty(&metadata).unwrap()
-                ));
-        
-                metadata
-            }
-            _ => env::panic_str("Failed to fetch NFT metadata"),
-        };
-        // Validate ownership
-        assert_eq!(
-            nft_metadata["owner_id"].as_str().unwrap(),
-            staker_id,
-            "You do not own NFT ID: {}",
-            nft_id
-        );
+            env::log_str(&format!(
+                "Fetched NFT Metadata: {}",
+                serde_json::to_string_pretty(&metadata).unwrap()
+            ));
 
-    // Classify NFT type
-    let nft_type = Self::classify_nft_type(&nft_metadata);
+            let nft_type = Self::classify_nft_type(&metadata);
 
-    // Fetch staker info or create new record
-    let mut staker_info = self.stakers.get(&staker_id).unwrap_or_else(|| StakerInfo {
-        stakes: Vector::new(format!("stakes_{}", staker_id).as_bytes().to_vec()),
-        total_rewards_claimed: 0,
-    });
+            // Update staker information
+            let mut staker_info = self.stakers.get(&staker_id).unwrap_or_else(|| StakerInfo {
+                stakes: Vector::new(format!("stakes_{}", staker_id).as_bytes().to_vec()),
+                total_rewards_claimed: 0,
+            });
 
-    // Initialize nft_types with explicit type
-    let mut nft_types: HashMap<String, String> = HashMap::new();
-    nft_types.insert(nft_id.clone(), nft_type);
+            let mut nft_types = HashMap::new();
+            nft_types.insert(token_id.clone(), nft_type);
 
-    // Add the NFT staking record
-    staker_info.stakes.push(&NFTStakingRecord {
-        nft_ids: vec![nft_id],
-        nft_types,
-        start_timestamp,
-        lockup_period: MONTH,
-        claimed_rewards: 0,
-    });
+            staker_info.stakes.push(&NFTStakingRecord {
+                nft_ids: vec![token_id.clone()],
+                nft_types,
+                start_timestamp,
+                lockup_period: MONTH,
+                claimed_rewards: 0,
+            });
 
-    self.stakers.insert(&staker_id, &staker_info);
-}
+            self.stakers.insert(&staker_id, &staker_info);
+
+            env::log_str(&format!("NFT {} successfully staked by {}", token_id, staker_id));
+        } else {
+            env::panic_str("Failed to fetch NFT metadata");
+        }
+    }
+
+
     pub fn classify_nft_type(meta: &Value) -> String {
         // Safely access reference_blob and attributes
-        let attributes = match meta.get("reference_blob")
+        let binding = vec![];
+        let attributes = meta
+            .get("reference_blob")
             .and_then(|blob| blob.get("attributes"))
-            .and_then(|attrs| attrs.as_array()) 
-        {
-            Some(attrs) => attrs,
-            None => return "Drone".to_string(), // Default to Drone if attributes are missing
-        };
-
-        // Search for specific attributes to classify the NFT
+            .and_then(|attrs| attrs.as_array())
+            .unwrap_or(&binding);
+    
+        let mut is_queen = false;
+        let mut is_worker = false;
+    
         for attribute in attributes {
             if let (Some(trait_type), Some(value)) = (
                 attribute.get("trait_type").and_then(|t| t.as_str()),
                 attribute.get("value").and_then(|v| v.as_str()),
             ) {
                 if trait_type == "Body" && value == "Queen" {
-                    return "Queen".to_string();
+                    is_queen = true;
                 } else if trait_type == "Wings" && value == "Diamond" {
-                    return "Worker".to_string();
+                    is_worker = true;
                 }
             }
         }
-
-        // Default to Drone if no specific match
-        "Drone".to_string()
+    
+        // Prioritize Queen over Worker
+        if is_queen {
+            "Queen".to_string()
+        } else if is_worker {
+            "Worker".to_string()
+        } else {
+            "Drone".to_string() // Default to Drone if no specific match
+        }
     }
 
-    pub fn distribute_rewards(&mut self) {
+    pub fn distribute_rewards(&mut self, amount: U128) {
         assert_eq!(
             env::predecessor_account_id(),
             self.owner,
             "Only owner can distribute rewards"
         );
 
-        let reward_pool = MONTHLY_REWARD;
+        assert!(
+            amount.0 <= self.reward_distribution.total_reward_pool,
+            "Insufficient funds in the reward pool for distribution"
+        );
+
+        let reward_pool = amount.0;
         let mut total_tpes = 0.0;
         let mut staker_tpes: HashMap<AccountId, Vec<(usize, f64)>> = HashMap::new();
 
@@ -231,10 +284,9 @@ impl NFTStakingContract {
                 stake.claimed_rewards += reward;
                 staker_info.stakes.replace(i as u64, &stake);
             }
-
             self.stakers.insert(&staker_id, &staker_info);
         }
-
+        self.reward_distribution.total_reward_pool -= reward_pool;
         self.last_distributed = env::block_timestamp();
     }
 
@@ -289,53 +341,54 @@ impl NFTStakingContract {
         staker_info.stakes.swap_remove(stake_index);
         self.stakers.insert(&staker_id, &staker_info);
 
-        for nft_id in nft_ids {
-            Promise::new(self.sin_nft_contract.clone()).function_call(
-                "nft_transfer".to_string(),
-                serde_json::to_vec(&json!({
-                    "receiver_id": staker_id,
-                    "token_id": nft_id,
-                }))
-                .unwrap(),
-                NearToken::from_yoctonear(1),
-                Gas::from_tgas(30),
-            );
-        }
+        let transfer_data: Vec<(String, AccountId)> = nft_ids
+            .iter()
+            .map(|nft_id| (nft_id.clone(), staker_id.clone()))
+            .collect();
+
+        Promise::new(self.sin_nft_contract.clone()).function_call(
+            "nft_batch_transfer".to_string(),
+            serde_json::to_vec(&json!({ "token_ids": transfer_data })).unwrap(),
+            NearToken::from_yoctonear(1),
+            Gas::from_tgas(100),
+        );
     }
 
     pub fn get_staking_info(&self, staker_id: AccountId) -> Vec<serde_json::Value> {
-        let staker_info = self.stakers.get(&staker_id).expect("Staker not found");
-
-        staker_info
-            .stakes
-            .iter()
-            .map(|stake| {
-                // Aggregate NFT type counts
-                let mut queen_count = 0;
-                let mut worker_count = 0;
-                let mut drone_count = 0;
-
-                for (_, nft_type) in stake.nft_types.iter() {
-                    match nft_type.as_str() {
-                        "Queen" => queen_count += 1,
-                        "Worker" => worker_count += 1,
-                        "Drone" => drone_count += 1,
-                        _ => (),
+        if let Some(staker_info) = self.stakers.get(&staker_id) {
+            staker_info
+                .stakes
+                .iter()
+                .map(|stake| {
+                    // Aggregate NFT type counts
+                    let mut queen_count = 0;
+                    let mut worker_count = 0;
+                    let mut drone_count = 0;
+    
+                    for (_, nft_type) in stake.nft_types.iter() {
+                        match nft_type.as_str() {
+                            "Queen" => queen_count += 1,
+                            "Worker" => worker_count += 1,
+                            "Drone" => drone_count += 1,
+                            _ => (),
+                        }
                     }
-                }
-
-                // Return the summarized data
-                json!({
-                    "nft_ids": stake.nft_ids,
-                    "queen": queen_count,
-                    "worker": worker_count,
-                    "drone": drone_count,
-                    "start_timestamp": stake.start_timestamp,
-                    "lockup_period": stake.lockup_period,
-                    "claimed_rewards": stake.claimed_rewards
+    
+                    // Return the summarized data
+                    json!({
+                        "nft_ids": stake.nft_ids,
+                        "queen": queen_count,
+                        "worker": worker_count,
+                        "drone": drone_count,
+                        "start_timestamp": stake.start_timestamp,
+                        "lockup_period": stake.lockup_period,
+                        "claimed_rewards": stake.claimed_rewards
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        } else {
+            vec![] // Return empty if no staking info is found
+        }
     }
 
     pub fn get_last_reward_distribution(&self) -> u64 {
@@ -350,5 +403,14 @@ impl NFTStakingContract {
         } else {
             0
         }
+    }
+    pub fn get_available_reward(&self) -> u128 {
+        self.reward_distribution.total_reward_pool
+    }
+    pub fn get_funding_details(&self) -> Vec<FundingRecord> {
+        self.reward_distribution
+            .funding_records
+            .iter()
+            .collect::<Vec<FundingRecord>>()
     }
 }
