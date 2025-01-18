@@ -120,7 +120,7 @@ impl NFTStakingContract {
 
     #[payable]
     pub fn nft_on_transfer(&mut self, sender_id: AccountId, token_id: String, msg: String) -> bool {
-        env::log_str(&format!("Received NFT {} from {} with message {}", token_id, sender_id, msg));
+        env::log_str(&format!("Received NFT {} from {} with metadata {}", token_id, sender_id, msg));
         
         // Ensure the call is from the authorized NFT contract
         assert_eq!(
@@ -128,77 +128,36 @@ impl NFTStakingContract {
             self.sin_nft_contract,
             "NFT can only be transferred from the SIN NFT contract"
         );
-
-        // Initiate metadata fetch
-        self.get_nft_metadata(self.sin_nft_contract.clone(), token_id.clone())
-            .then(
-                Self::ext(env::current_account_id()).on_fetch_metadata(
-                    sender_id.clone(),
-                    token_id.clone(),
-                    env::block_timestamp(),
-                ),
-            );
-
+    
+        // Parse the metadata directly from the msg parameter
+        let metadata: Value = serde_json::from_str(&msg).expect("Failed to parse metadata from msg");
+    
+        // Classify the NFT type
+        let nft_type = Self::classify_nft_type(&metadata);
+    
+        // Update staker information
+        let mut staker_info = self.stakers.get(&sender_id).unwrap_or_else(|| StakerInfo {
+            stakes: Vector::new(format!("stakes_{}", sender_id).as_bytes().to_vec()),
+            total_rewards_claimed: 0,
+        });
+    
+        let mut nft_types = HashMap::new();
+        nft_types.insert(token_id.clone(), nft_type);
+    
+        staker_info.stakes.push(&NFTStakingRecord {
+            nft_ids: vec![token_id.clone()],
+            nft_types,
+            start_timestamp: env::block_timestamp(),
+            lockup_period: MONTH,
+            claimed_rewards: 0,
+        });
+    
+        self.stakers.insert(&sender_id, &staker_info);
+    
+        env::log_str(&format!("NFT {} successfully staked by {}", token_id, sender_id));
+    
         // Returning `false` ensures the NFT is not refunded
         false
-    }
-
-
-    pub fn get_nft_metadata(&self, nft_contract_id: AccountId, token_id: String) -> Promise {
-        Promise::new(nft_contract_id).function_call(
-            "nft_token".to_string(), // Call the `nft_token` method
-            serde_json::json!({ "token_id": token_id })
-                .to_string()
-                .into_bytes(),
-            NearToken::from_yoctonear(0), // Attach no deposit for view call
-            Gas::from_tgas(20),          // Sufficient gas for cross-contract call
-        )
-    }
-
-
-    #[private]
-    pub fn on_fetch_metadata(
-        &mut self,
-        staker_id: AccountId,
-        token_id: String,
-        start_timestamp: u64,
-        #[callback_result] call_result: Result<String, near_sdk::PromiseError>,
-    ) {
-        // Handle metadata fetch result
-        if let Ok(metadata_str) = call_result {
-            let metadata: Value =
-                serde_json::from_str(&metadata_str).expect("Failed to parse NFT metadata");
-
-            env::log_str(&format!(
-                "Fetched NFT Metadata: {}",
-                serde_json::to_string_pretty(&metadata).unwrap()
-            ));
-
-            let nft_type = Self::classify_nft_type(&metadata);
-
-            // Update staker information
-            let mut staker_info = self.stakers.get(&staker_id).unwrap_or_else(|| StakerInfo {
-                stakes: Vector::new(format!("stakes_{}", staker_id).as_bytes().to_vec()),
-                total_rewards_claimed: 0,
-            });
-
-            let mut nft_types = HashMap::new();
-            nft_types.insert(token_id.clone(), nft_type);
-
-            staker_info.stakes.push(&NFTStakingRecord {
-                nft_ids: vec![token_id.clone()],
-                nft_types,
-                start_timestamp,
-                lockup_period: MONTH,
-                claimed_rewards: 0,
-            });
-
-            self.stakers.insert(&staker_id, &staker_info);
-
-            env::log_str(&format!("NFT {} successfully staked by {}", token_id, staker_id));
-        } else {
-            env::panic_str("Failed to fetch NFT metadata");
-        }
     }
 
 
