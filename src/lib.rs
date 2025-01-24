@@ -292,24 +292,24 @@ impl NFTStakingContract {
         let stake = staker_info.stakes.get(stake_index).unwrap();
         let current_time = env::block_timestamp();
         assert!(
-            current_time >= stake.start_timestamp + stake.lockup_period,
+            current_time >= stake.start_timestamp + stake.lockup_period * 1_000_000_000,
             "Cannot unstake before lockup period"
         );
 
         let nft_ids = stake.nft_ids.clone();
+        let nft_id = nft_ids.get(0);
         staker_info.stakes.swap_remove(stake_index);
         self.stakers.insert(&staker_id, &staker_info);
 
-        let transfer_data: Vec<(String, AccountId)> = nft_ids
-            .iter()
-            .map(|nft_id| (nft_id.clone(), staker_id.clone()))
-            .collect();
-
         Promise::new(self.sin_nft_contract.clone()).function_call(
-            "nft_batch_transfer".to_string(),
-            serde_json::to_vec(&json!({ "token_ids": transfer_data })).unwrap(),
-            NearToken::from_yoctonear(1),
-            Gas::from_tgas(100),
+            "nft_transfer".to_string(),
+            serde_json::to_vec(&json!({
+                "receiver_id": staker_id,
+                "token_id": nft_id
+            }))
+            .unwrap(),
+            NearToken::from_yoctonear(1), // Attach 1 yoctoNEAR
+            Gas::from_tgas(50),
         );
     }
 
